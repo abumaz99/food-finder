@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Forkward — Holiday Food Finder</title>
+<meta name="description" content="A wandering eater's almanack for choosing what to eat, abroad and otherwise." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,500;0,9..144,700;0,9..144,900;1,9..144,400&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<div class="frame">
+  <header class="masthead">
+    <div class="dateline" id="dateline">— FEUILLETON —</div>
+    <div>
+      <h1 class="logo">Forkward</h1>
+      <p class="tagline">A wandering eater's almanack for choosing what to eat, abroad &amp; otherwise</p>
+    </div>
+    <div class="editionline">VOL. I · ED. DAILY</div>
+  </header>
+
+  <div class="layout">
+    <aside class="controls">
+      <div class="field">
+        <div class="section-title">I. Whereabouts</div>
+        <label for="location">Your Location</label>
+        <div class="location-input">
+          <input type="text" id="location" placeholder="City, neighbourhood, or address" />
+          <button class="btn-icon" id="gpsBtn" title="Use GPS">⊙</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="section-title">II. Reach</div>
+        <div class="range-row">
+          <label for="distance">Distance</label>
+          <span class="range-value" id="distanceVal">1.5 km</span>
+        </div>
+        <input type="range" id="distance" min="0.3" max="10" step="0.1" value="1.5" />
+      </div>
+
+      <div class="field">
+        <div class="section-title">III. The Damage</div>
+        <label>Price Point</label>
+        <div class="price-pills" id="pricePills">
+          <div class="pill active" data-price="1">£</div>
+          <div class="pill active" data-price="2">££</div>
+          <div class="pill active" data-price="3">£££</div>
+          <div class="pill active" data-price="4">££££</div>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="section-title">IV. Cuisine</div>
+        <label>Pick Your Pleasure</label>
+        <div class="cuisine-pills" id="cuisinePills"></div>
+      </div>
+
+      <div class="field">
+        <div class="section-title">V. Particulars</div>
+        <label class="toggle-row">
+          <input type="checkbox" id="openNowOnly" />
+          Open Now Only
+        </label>
+      </div>
+
+      <div class="actions">
+        <button class="primary" id="searchBtn">Find Me Dinner →</button>
+        <button class="secondary" id="surpriseBtn">✦ Surprise Me</button>
+      </div>
+    </aside>
+
+    <main class="results">
+      <div class="tabs">
+        <button class="tab active" data-tab="list">The List <span class="count" id="listCount"></span></button>
+        <button class="tab" data-tab="map">The Map</button>
+        <button class="tab" data-tab="favorites">Favourites <span class="count" id="favCount">0</span></button>
+      </div>
+
+      <div id="errorBox" style="display:none;"></div>
+
+      <div class="surprise-wrap" id="surpriseBox">
+        <div class="surprise-meta" id="surpriseMeta"></div>
+        <h2 id="surpriseName"></h2>
+        <div class="surprise-addr" id="surpriseAddr"></div>
+        <div class="surprise-actions">
+          <button id="surpriseAgain">Try Another</button>
+          <button id="surpriseClose">Close</button>
+        </div>
+      </div>
+
+      <div id="tab-list" class="tab-panel">
+        <div class="status" id="initialStatus">
+          <div class="ornament">❦</div>
+          <h3>Where shall we eat tonight?</h3>
+          <p>Set your location and preferences, then let the almanack do its work.</p>
+        </div>
+        <div id="resultsContent" style="display:none;">
+          <div class="results-meta">
+            <div class="count-display"><b id="resultCount">0</b> restaurants found</div>
+            <div>
+              <span class="sort-by">Sort by</span>
+              <select id="sortBy">
+                <option value="distance">Distance</option>
+                <option value="name">Name (A→Z)</option>
+                <option value="price-low">Price ↑</option>
+                <option value="price-high">Price ↓</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid" id="grid"></div>
+        </div>
+      </div>
+
+      <div id="tab-map" class="tab-panel" style="display:none;">
+        <div id="map"></div>
+      </div>
+
+      <div id="tab-favorites" class="tab-panel" style="display:none;">
+        <div class="status" id="favStatus">
+          <div class="ornament">★</div>
+          <h3>No favourites yet</h3>
+          <p>Star a restaurant from the list to bookmark it for later — they'll be saved on this device.</p>
+        </div>
+        <div id="favGrid" class="grid" style="display:none;"></div>
+      </div>
+    </main>
+  </div>
+
+  <footer class="colophon">
+    <span>Set in Fraunces &amp; JetBrains Mono</span>
+    <span>Data via OpenStreetMap contributors</span>
+    <span>© Forkward MMXXVI</span>
+  </footer>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="js/cuisines.js"></script>
+<script src="js/utils.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
