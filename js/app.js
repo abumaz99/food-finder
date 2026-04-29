@@ -130,6 +130,32 @@ async function geocode(query) {
   };
 }
 
+// ============ OVERPASS FETCH ============
+const OVERPASS_ENDPOINTS = [
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass-api.de/api/interpreter'
+];
+
+async function fetchOverpass(query) {
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        body: 'data=' + encodeURIComponent(query),
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (res.ok) return res.json();
+    } catch (_) {
+      clearTimeout(timer);
+      // network error or timeout — try next endpoint
+    }
+  }
+  throw new Error('Could not reach Overpass API — try again shortly');
+}
+
 // ============ SEARCH ============
 async function search() {
   hideError();
@@ -156,19 +182,14 @@ async function search() {
     if (!state.lat) throw new Error('Could not determine location');
 
     const radius = parseFloat(document.getElementById('distance').value) * 1000;
-    const q = `[out:json][timeout:25];
+    const q = `[out:json][timeout:15];
 (
   node["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
   way["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
 );
-out center tags 200;`;
+out center qt tags 150;`;
 
-    const res = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      body: 'data=' + encodeURIComponent(q)
-    });
-    if (!res.ok) throw new Error('Overpass API request failed');
-    const data = await res.json();
+    const data = await fetchOverpass(q);
 
     state.results = data.elements
       .map(el => parseElement(el))
@@ -381,9 +402,9 @@ function renderFavorites() {
 function renderMap() {
   if (!state.map) {
     state.map = L.map('map').setView([state.lat || 51.5, state.lon || -0.1], 14);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
       maxZoom: 19,
-      attribution: '© OpenStreetMap contributors'
+      attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>'
     }).addTo(state.map);
   } else {
     if (state.lat) state.map.setView([state.lat, state.lon], 14);
@@ -411,9 +432,10 @@ function renderMap() {
       iconAnchor: [12, 12]
     });
     const marker = L.marker([r.lat, r.lon], { icon }).addTo(state.map);
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(r.name + ' ' + r.address)}`;
     marker.bindPopup(`
       <div class="map-popup">
-        <h4>${escapeHtml(r.name)}</h4>
+        <h4><a href="${searchUrl}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a></h4>
         <p>${escapeHtml(r.cuisines.join(' · '))}</p>
         <p>${'£'.repeat(r.price)} · ${r.distance < 1 ? Math.round(r.distance * 1000) + ' m' : r.distance.toFixed(1) + ' km'}</p>
       </div>
