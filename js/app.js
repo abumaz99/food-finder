@@ -7,13 +7,15 @@
 const INITIAL_VISIBLE_RESULTS = 100;
 const RESULTS_INCREMENT = 100;
 const MAP_CLUSTER_SIZE_PX = 64;
-const OVERPASS_TIMEOUT_MS = 15000;
+const OVERPASS_TIMEOUT_MS = 18000;
+const OVERPASS_STAGGER_MS = 1200;
 const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter'
 ];
 const FAVORITES_STORAGE_KEY = 'forkward:favorites';
+const OVERPASS_ENDPOINT_STORAGE_KEY = 'forkward:lastOverpassEndpoint';
 
 const state = {
   lat: null,
@@ -204,42 +206,137 @@ async function geocode(query, signal) {
 
 // ============ OVERPASS FETCH ============
 async function fetchOverpass(query, signal) {
+  if (signal && signal.aborted) throw new DOMException('Search cancelled', 'AbortError');
+
+  updateSearchStatus('Looking for nearby food spots…');
+
   let lastStatus = null;
-  for (let i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
-    if (signal && signal.aborted) throw new DOMException('Search cancelled', 'AbortError');
+  const controllers = [];
+  const raceController = new AbortController();
+  const abortRace = () => raceController.abort();
+  if (signal) signal.addEventListener('abort', abortRace, { once: true });
 
-    const endpoint = OVERPASS_ENDPOINTS[i];
-    updateSearchStatus(`Checking map data source ${i + 1} of ${OVERPASS_ENDPOINTS.length}…`);
+  const endpoints = getPreferredOverpassEndpoints();
+  const requests = endpoints.map((endpoint, index) =>
+    delayedOverpassRequest(endpoint, query, raceController.signal, index * OVERPASS_STAGGER_MS, controllers)
+      .then(data => ({ endpoint, data }))
+      .catch(err => {
+        if (raceController.signal.aborted) throw err;
+        if (err && err.status) lastStatus = err.status;
+        throw err;
+      })
+  );
 
-    const controller = new AbortController();
-    const abortSearch = () => controller.abort();
-    if (signal) signal.addEventListener('abort', abortSearch, { once: true });
-    const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: 'data=' + encodeURIComponent(query),
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-      if (res.ok) return res.json();
-      lastStatus = res.status;
-    } catch (err) {
-      clearTimeout(timer);
-      if (signal && signal.aborted) throw err;
-      // network error or timeout — try next endpoint
-    } finally {
-      if (signal) signal.removeEventListener('abort', abortSearch);
-    }
+  try {
+    const winner = await firstSuccessful(requests);
+    rememberOverpassEndpoint(winner.endpoint);
+    return winner.data;
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    throw overpassUnavailableError(lastStatus);
+  } finally {
+    raceController.abort();
+    if (signal) signal.removeEventListener('abort', abortRace);
+    controllers.forEach(controller => controller.abort());
   }
+}
+
+async function delayedOverpassRequest(endpoint, query, signal, delayMs, controllers) {
+  if (delayMs > 0) {
+    await delay(delayMs, signal);
+  }
+  if (signal && signal.aborted) throw new DOMException('Search cancelled', 'AbortError');
+
+  const controller = new AbortController();
+  controllers.push(controller);
+  const abortSearch = () => controller.abort();
+  if (signal) signal.addEventListener('abort', abortSearch, { once: true });
+  const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'data=' + encodeURIComponent(query),
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      const err = new Error(`Overpass returned ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+
+    return res.json();
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', abortSearch);
+  }
+}
+
+function firstSuccessful(promises) {
+  return new Promise((resolve, reject) => {
+    let rejectedCount = 0;
+    let lastError = null;
+
+    promises.forEach(promise => {
+      promise.then(resolve).catch(err => {
+        rejectedCount += 1;
+        lastError = err;
+        if (rejectedCount === promises.length) reject(lastError);
+      });
+    });
+  });
+}
+
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(new DOMException('Search cancelled', 'AbortError'));
+      return;
+    }
+
+    let abortDelay = null;
+    const timer = setTimeout(() => {
+      if (signal && abortDelay) signal.removeEventListener('abort', abortDelay);
+      resolve();
+    }, ms);
+    abortDelay = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abortDelay);
+      reject(new DOMException('Search cancelled', 'AbortError'));
+    };
+    if (signal) signal.addEventListener('abort', abortDelay, { once: true });
+  });
+}
+
+function getPreferredOverpassEndpoints() {
+  let preferred = null;
+  try {
+    preferred = localStorage.getItem(OVERPASS_ENDPOINT_STORAGE_KEY);
+  } catch (_) {
+    preferred = null;
+  }
+  if (!preferred || !OVERPASS_ENDPOINTS.includes(preferred)) return OVERPASS_ENDPOINTS;
+  return [preferred, ...OVERPASS_ENDPOINTS.filter(endpoint => endpoint !== preferred)];
+}
+
+function rememberOverpassEndpoint(endpoint) {
+  try {
+    localStorage.setItem(OVERPASS_ENDPOINT_STORAGE_KEY, endpoint);
+  } catch (_) {
+    // A remembered endpoint is only an optimization.
+  }
+}
+
+function overpassUnavailableError(lastStatus) {
   const hint = lastStatus === 429
     ? 'rate-limited — wait a moment'
     : 'all servers busy — try a smaller radius';
-  throw new Error(`Overpass unavailable (${hint})`);
+  return new Error(`Map data is busy (${hint})`);
 }
 
 // ============ SEARCH ============
