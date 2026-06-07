@@ -19,7 +19,7 @@ Once you've enabled GitHub Pages on this repo, the app lives at:
 - 🕒 **Open now** filter — parses OpenStreetMap opening hours
 - 🗺️ **Map view** — interactive Leaflet map with custom price-level markers
 - ✦ **Surprise me** — picks one at random from your filtered results
-- ★ **Favourites** — bookmark spots for later (saved for the session)
+- ★ **Favourites** — bookmark spots for later (saved on this device)
 
 ## Stack
 
@@ -79,7 +79,7 @@ Then visit <http://localhost:8000>.
 - **Price levels are approximated.** OSM has no price tag; we infer from amenity type (`fast_food` → £, `restaurant` → ££) and bump to ££££ on keywords like "michelin" or "fine dining". For real Google-style price tiers, swap the Overpass call for the [Google Places API](https://developers.google.com/maps/documentation/places/web-service/overview) or [Foursquare Places](https://docs.foursquare.com/developer/reference/places-api-overview) — both require API keys.
 - **Opening-hours parsing is best-effort.** OSM's `opening_hours` syntax is rich; the parser handles common patterns (e.g. `Mo-Fr 09:00-17:00; Sa,Su 10:00-22:00`, `24/7`) but may show "?" for complex strings.
 - **Coverage depends on OSM data quality.** Dense urban areas (London, Lisbon, Tokyo) are excellent. Smaller towns and rural areas may be sparse.
-- **Favourites are session-only** in this version — they reset when you close the tab. Persisting them with `localStorage` is a small addition for a future iteration.
+- **Favourites are device-local.** They are stored in your browser with `localStorage`, so they stay on this device but do not sync across browsers.
 
 ## Attribution
 

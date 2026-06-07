@@ -255,11 +255,13 @@ input[type="range"]::-moz-range-thumb {
   padding: 6px 12px;
   border: 1.5px solid var(--line);
   background: var(--bg);
+  color: var(--ink);
   font-family: 'Fraunces', serif;
   font-size: 13px;
   cursor: pointer;
   transition: all 0.15s;
   user-select: none;
+  border-radius: 0;
 }
 
 .pill:hover {
@@ -274,6 +276,17 @@ input[type="range"]::-moz-range-thumb {
   border-color: var(--accent-deep);
   transform: translate(-1px, -1px);
   box-shadow: 2px 2px 0 var(--ink);
+}
+
+.pill:focus-visible,
+.fav-btn:focus-visible,
+.mini-btn:focus-visible,
+.tab:focus-visible,
+button.primary:focus-visible,
+button.secondary:focus-visible,
+.result-limit button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .toggle-row {
@@ -621,6 +634,39 @@ main.results {
   color: var(--paper);
 }
 
+.result-limit {
+  border: 1.5px dashed var(--line);
+  background: var(--paper);
+  padding: 16px;
+  text-align: center;
+}
+
+.result-limit p {
+  color: var(--ink-soft);
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+
+.result-limit.subtle p {
+  margin-bottom: 0;
+}
+
+.result-limit button {
+  padding: 8px 14px;
+  border: 1.5px solid var(--line);
+  background: var(--ink);
+  color: var(--paper);
+  cursor: pointer;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.result-limit button:hover {
+  background: var(--accent);
+}
+
 /* ============ MAP ============ */
 #map {
   width: 100%;
@@ -649,6 +695,44 @@ main.results {
   font-size: 12px;
   color: var(--ink-soft);
   margin-bottom: 4px;
+}
+
+.map-user-marker {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--ink);
+  border: 3px solid var(--accent);
+  box-shadow: 0 0 0 4px rgba(210,57,30,0.25);
+}
+
+.map-price-marker,
+.map-cluster-marker {
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  color: var(--ink);
+  box-shadow: 2px 2px 0 var(--line);
+}
+
+.map-price-marker {
+  width: 24px;
+  height: 24px;
+  background: var(--paper);
+  border: 2px solid var(--line);
+  font-size: 11px;
+}
+
+.map-cluster-marker {
+  width: 34px;
+  height: 34px;
+  background: var(--gold);
+  border: 2px solid var(--line);
+  color: var(--paper);
+  font-size: 12px;
 }
 
 .price-pills .pill.active::before {

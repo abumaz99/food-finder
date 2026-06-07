@@ -4,24 +4,42 @@
  */
 
 // ============ STATE ============
+const INITIAL_VISIBLE_RESULTS = 100;
+const RESULTS_INCREMENT = 100;
+const MAP_CLUSTER_SIZE_PX = 64;
+const OVERPASS_TIMEOUT_MS = 15000;
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter'
+];
+const FAVORITES_STORAGE_KEY = 'forkward:favorites';
+
 const state = {
   lat: null,
   lon: null,
   locationLabel: '',
   lastGeocodedInput: '',
+  lastGeocodedCoords: null,
   results: [],
   filteredResults: [],
   favorites: [],
+  visibleCount: INITIAL_VISIBLE_RESULTS,
+  searchRadiusKm: null,
   selectedPrices: new Set([1, 2, 3, 4]),
   selectedCuisines: new Set(),
   map: null,
   markers: [],
+  searchController: null,
   currentTab: 'list',
   searching: false
 };
 
 // ============ INIT ============
 function init() {
+  loadFavorites();
+  updateFavoriteCount();
+
   // Date in masthead
   const d = new Date();
   const dateStr = d.toLocaleDateString('en-GB', {
@@ -32,31 +50,23 @@ function init() {
   // Cuisine pills
   const cuisinePills = document.getElementById('cuisinePills');
   Object.keys(CUISINES).forEach(cuisine => {
-    const pill = document.createElement('div');
+    const pill = document.createElement('button');
+    pill.type = 'button';
     pill.className = 'pill';
     pill.textContent = cuisine;
     pill.dataset.cuisine = cuisine;
+    pill.setAttribute('aria-pressed', 'false');
     pill.addEventListener('click', () => {
-      pill.classList.toggle('active');
-      if (pill.classList.contains('active')) {
-        state.selectedCuisines.add(cuisine);
-      } else {
-        state.selectedCuisines.delete(cuisine);
-      }
+      toggleCuisineFilter(pill, cuisine);
     });
     cuisinePills.appendChild(pill);
   });
 
   // Price pills
   document.querySelectorAll('#pricePills .pill').forEach(pill => {
+    pill.setAttribute('aria-pressed', 'true');
     pill.addEventListener('click', () => {
-      const price = parseInt(pill.dataset.price);
-      pill.classList.toggle('active');
-      if (pill.classList.contains('active')) {
-        state.selectedPrices.add(price);
-      } else {
-        state.selectedPrices.delete(price);
-      }
+      togglePriceFilter(pill);
     });
   });
 
@@ -65,29 +75,68 @@ function init() {
   const distanceVal = document.getElementById('distanceVal');
   distanceInput.addEventListener('input', () => {
     distanceVal.textContent = `${getDistanceKm().toFixed(1)} km`;
+    if (state.results.length) refreshFilters();
+  });
+  distanceInput.addEventListener('change', () => {
+    if (!state.results.length || state.searching) return;
+    if (state.searchRadiusKm !== null && getDistanceKm() > state.searchRadiusKm) {
+      search();
+    }
   });
 
   document.getElementById('gpsBtn').addEventListener('click', useGPS);
-  document.getElementById('searchBtn').addEventListener('click', search);
+  document.getElementById('searchBtn').addEventListener('click', () => {
+    if (state.searching) cancelSearch();
+    else search();
+  });
   document.getElementById('surpriseBtn').addEventListener('click', surpriseMe);
 
   document.querySelectorAll('.tab').forEach(t => {
     t.addEventListener('click', () => switchTab(t.dataset.tab));
   });
 
-  document.getElementById('sortBy').addEventListener('change', () => sortAndRender());
+  document.getElementById('sortBy').addEventListener('change', () => {
+    state.visibleCount = INITIAL_VISIBLE_RESULTS;
+    sortAndRender();
+  });
 
   document.getElementById('openNowOnly').addEventListener('change', () => {
-    if (state.results.length) {
-      applyFilters();
-      sortAndRender();
-    }
+    if (state.results.length) refreshFilters();
   });
 
   document.getElementById('surpriseAgain').addEventListener('click', surpriseMe);
   document.getElementById('surpriseClose').addEventListener('click', () => {
     document.getElementById('surpriseBox').classList.remove('visible');
   });
+}
+
+function toggleCuisineFilter(pill, cuisine) {
+  const isActive = pill.classList.toggle('active');
+  pill.setAttribute('aria-pressed', String(isActive));
+  if (isActive) {
+    state.selectedCuisines.add(cuisine);
+  } else {
+    state.selectedCuisines.delete(cuisine);
+  }
+  if (state.results.length) refreshFilters();
+}
+
+function togglePriceFilter(pill) {
+  const price = parseInt(pill.dataset.price);
+  const isActive = pill.classList.toggle('active');
+  pill.setAttribute('aria-pressed', String(isActive));
+  if (isActive) {
+    state.selectedPrices.add(price);
+  } else {
+    state.selectedPrices.delete(price);
+  }
+  if (state.results.length) refreshFilters();
+}
+
+function refreshFilters() {
+  state.visibleCount = INITIAL_VISIBLE_RESULTS;
+  applyFilters();
+  sortAndRender();
 }
 
 // ============ GPS ============
@@ -103,6 +152,8 @@ function useGPS() {
     pos => {
       state.lat = pos.coords.latitude;
       state.lon = pos.coords.longitude;
+      state.lastGeocodedInput = '';
+      state.lastGeocodedCoords = null;
       document.getElementById('location').value =
         `${state.lat.toFixed(4)}, ${state.lon.toFixed(4)}`;
       state.locationLabel = 'your location';
@@ -119,9 +170,14 @@ function useGPS() {
 }
 
 // ============ GEOCODE ============
-async function geocode(query) {
+async function geocode(query, signal) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
   const controller = new AbortController();
+  const abortSearch = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', abortSearch, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
     const res = await fetch(url, {
@@ -137,25 +193,28 @@ async function geocode(query) {
       display: data[0].display_name
     };
   } catch (e) {
+    if (e.name === 'AbortError' && signal && signal.aborted) throw e;
     if (e.name === 'AbortError') throw new Error('Geocoding timed out — try again');
     throw e;
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', abortSearch);
   }
 }
 
 // ============ OVERPASS FETCH ============
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter'
-];
-
-async function fetchOverpass(query) {
+async function fetchOverpass(query, signal) {
   let lastStatus = null;
-  for (const endpoint of OVERPASS_ENDPOINTS) {
+  for (let i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
+    if (signal && signal.aborted) throw new DOMException('Search cancelled', 'AbortError');
+
+    const endpoint = OVERPASS_ENDPOINTS[i];
+    updateSearchStatus(`Checking map data source ${i + 1} of ${OVERPASS_ENDPOINTS.length}…`);
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30000);
+    const abortSearch = () => controller.abort();
+    if (signal) signal.addEventListener('abort', abortSearch, { once: true });
+    const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -169,9 +228,12 @@ async function fetchOverpass(query) {
       clearTimeout(timer);
       if (res.ok) return res.json();
       lastStatus = res.status;
-    } catch (_) {
+    } catch (err) {
       clearTimeout(timer);
+      if (signal && signal.aborted) throw err;
       // network error or timeout — try next endpoint
+    } finally {
+      if (signal) signal.removeEventListener('abort', abortSearch);
     }
   }
   const hint = lastStatus === 429
@@ -186,31 +248,38 @@ async function search() {
 
   hideError();
   const locInput = document.getElementById('location').value.trim();
-  if (!locInput && state.lat === null) {
+  if (!locInput && (state.lat === null || state.lon === null)) {
     showError('Please enter a location or use GPS.');
     return;
   }
 
   state.searching = true;
+  state.searchController = new AbortController();
   const searchBtn = document.getElementById('searchBtn');
   const originalLabel = searchBtn.textContent;
-  searchBtn.disabled = true;
-  searchBtn.textContent = 'Searching…';
+  searchBtn.textContent = 'Cancel Search';
   showLoading();
 
   try {
     if (locInput && !locInput.match(/^-?\d+\.\d+,\s*-?\d+\.\d+$/)) {
-      if (locInput !== state.lastGeocodedInput || state.lat === null || state.lon === null) {
-        const geo = await geocode(locInput);
+      if (locInput !== state.lastGeocodedInput || !state.lastGeocodedCoords) {
+        updateSearchStatus('Finding those coordinates…');
+        const geo = await geocode(locInput, state.searchController.signal);
         state.lat = geo.lat;
         state.lon = geo.lon;
         state.locationLabel = geo.display.split(',')[0];
         state.lastGeocodedInput = locInput;
+        state.lastGeocodedCoords = { lat: geo.lat, lon: geo.lon };
+      } else {
+        state.lat = state.lastGeocodedCoords.lat;
+        state.lon = state.lastGeocodedCoords.lon;
       }
     } else if (locInput.match(/^-?\d+\.\d+,\s*-?\d+\.\d+$/)) {
       const [lat, lon] = locInput.split(',').map(s => parseFloat(s.trim()));
       state.lat = lat;
       state.lon = lon;
+      state.lastGeocodedInput = '';
+      state.lastGeocodedCoords = null;
     }
 
     if (state.lat === null || state.lon === null) throw new Error('Could not determine location');
@@ -221,30 +290,51 @@ async function search() {
     }
 
     const radius = Math.round(radiusKm * 1000);
-    const q = `[out:json][timeout:25];
+    const q = `[out:json][timeout:14];
 (
   node["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
   way["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
 );
 out center qt tags;`;
 
-    const data = await fetchOverpass(q);
+    const data = await fetchOverpass(q, state.searchController.signal);
 
     state.results = data.elements
       .map(el => parseElement(el))
       .filter(r => r && r.name && r.distance <= radiusKm);
+    state.searchRadiusKm = radiusKm;
+    state.visibleCount = INITIAL_VISIBLE_RESULTS;
 
     applyFilters();
     sortAndRender();
   } catch (err) {
-    showError('Search failed: ' + err.message);
-    document.getElementById('initialStatus').style.display = 'block';
-    document.getElementById('resultsContent').style.display = 'none';
+    if (isAbortError(err)) {
+      if (state.filteredResults.length) {
+        renderResults();
+      } else {
+        showIdleStatus('Search cancelled', 'Adjust the filters or try again when you are ready.');
+      }
+    } else {
+      showError('Search failed: ' + err.message);
+      if (state.filteredResults.length) {
+        renderResults();
+      } else {
+        showIdleStatus('Search could not finish', 'Try again in a moment, or use a smaller radius while map data is busy.');
+      }
+    }
   } finally {
     state.searching = false;
-    searchBtn.disabled = false;
     searchBtn.textContent = originalLabel;
+    state.searchController = null;
   }
+}
+
+function cancelSearch() {
+  if (state.searchController) state.searchController.abort();
+}
+
+function isAbortError(err) {
+  return err && err.name === 'AbortError';
 }
 
 // ============ PARSE OSM ELEMENT ============
@@ -324,9 +414,32 @@ function getDistanceKm() {
   return parseFloat(document.getElementById('distance').value);
 }
 
+function formatDistance(distanceKm) {
+  return distanceKm < 1
+    ? `${Math.round(distanceKm * 1000)} m`
+    : `${distanceKm.toFixed(1)} km`;
+}
+
+function safeHttpUrl(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const candidate = /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    return url.href;
+  } catch (_) {
+    return null;
+  }
+}
+
 function applyFilters() {
   const openNowOnly = document.getElementById('openNowOnly').checked;
+  const radiusKm = getDistanceKm();
   state.filteredResults = state.results.filter(r => {
+    if (Number.isFinite(radiusKm) && r.distance > radiusKm) return false;
     if (!state.selectedPrices.has(r.price)) return false;
     if (state.selectedCuisines.size > 0) {
       const matches = r.cuisines.some(c => state.selectedCuisines.has(c));
@@ -367,7 +480,12 @@ function renderResults() {
     return;
   }
 
-  grid.innerHTML = state.filteredResults.map(r => cardHTML(r)).join('');
+  const visibleResults = getVisibleResults();
+  const remaining = state.filteredResults.length - visibleResults.length;
+  const expandedRadiusNote = getExpandedRadiusNote();
+  grid.innerHTML = visibleResults.map(r => cardHTML(r)).join('')
+    + `${remaining > 0 ? loadMoreHTML(remaining) : ''}`
+    + `${expandedRadiusNote ? resultNoticeHTML(expandedRadiusNote) : ''}`;
 
   grid.querySelectorAll('.fav-btn').forEach(btn => {
     btn.addEventListener('click', e => {
@@ -375,20 +493,56 @@ function renderResults() {
       toggleFavorite(btn.dataset.id);
     });
   });
+  const loadMoreBtn = document.getElementById('loadMoreResults');
+  if (loadMoreBtn) {
+    loadMoreBtn.addEventListener('click', () => {
+      state.visibleCount += RESULTS_INCREMENT;
+      renderResults();
+    });
+  }
+}
+
+function getVisibleResults() {
+  return state.filteredResults.slice(0, state.visibleCount);
+}
+
+function loadMoreHTML(remaining) {
+  const nextCount = Math.min(RESULTS_INCREMENT, remaining);
+  return `
+    <div class="result-limit" style="grid-column: 1/-1;">
+      <p>Showing the nearest ${getVisibleResults().length} of ${state.filteredResults.length} matching food spots.</p>
+      <button id="loadMoreResults" type="button">Show ${nextCount} More</button>
+    </div>
+  `;
+}
+
+function resultNoticeHTML(message) {
+  return `
+    <div class="result-limit subtle" style="grid-column: 1/-1;">
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
+}
+
+function getExpandedRadiusNote() {
+  const radiusKm = getDistanceKm();
+  if (state.searchRadiusKm !== null && radiusKm > state.searchRadiusKm) {
+    return `Showing matches from the last ${state.searchRadiusKm.toFixed(1)} km search. Run search again to expand to ${radiusKm.toFixed(1)} km.`;
+  }
+  return '';
 }
 
 function cardHTML(r) {
   const isFav = state.favorites.some(f => f.id === r.id);
   const priceStr = '£'.repeat(r.price);
-  const distStr = r.distance < 1
-    ? `${Math.round(r.distance * 1000)} m`
-    : `${r.distance.toFixed(1)} km`;
+  const distStr = formatDistance(r.distance);
   let openTag = '';
   if      (r.isOpen === true)  openTag = '<span class="open-now">● Open now</span>';
   else if (r.isOpen === false) openTag = '<span class="closed-now">● Closed</span>';
 
   const osmUrl = `https://www.openstreetmap.org/${r.osmType}/${r.osmId}`;
   const directionsUrl = `https://www.google.com/maps/dir/?api=1&destination=${r.lat},${r.lon}`;
+  const websiteUrl = safeHttpUrl(r.website);
 
   return `
     <article class="card" data-id="${r.id}">
@@ -405,7 +559,7 @@ function cardHTML(r) {
       <div class="address">${escapeHtml(r.address)}</div>
       <div class="card-footer">
         <a class="mini-btn" href="${directionsUrl}" target="_blank" rel="noopener">↗ Directions</a>
-        ${r.website ? `<a class="mini-btn" href="${escapeAttr(r.website)}" target="_blank" rel="noopener">⌘ Website</a>` : ''}
+        ${websiteUrl ? `<a class="mini-btn" href="${escapeAttr(websiteUrl)}" target="_blank" rel="noopener">⌘ Website</a>` : ''}
         <a class="mini-btn" href="${osmUrl}" target="_blank" rel="noopener">ⓘ More</a>
       </div>
     </article>
@@ -421,9 +575,32 @@ function toggleFavorite(id) {
   if (idx >= 0) state.favorites.splice(idx, 1);
   else          state.favorites.push(r);
 
-  document.getElementById('favCount').textContent = state.favorites.length;
+  saveFavorites();
+  updateFavoriteCount();
   renderResults();
   renderFavorites();
+}
+
+function loadFavorites() {
+  try {
+    const stored = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    const parsed = stored ? JSON.parse(stored) : [];
+    state.favorites = Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    state.favorites = [];
+  }
+}
+
+function saveFavorites() {
+  try {
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(state.favorites));
+  } catch (_) {
+    // Favourites still work for this session if storage is unavailable.
+  }
+}
+
+function updateFavoriteCount() {
+  document.getElementById('favCount').textContent = state.favorites.length;
 }
 
 function renderFavorites() {
@@ -432,6 +609,7 @@ function renderFavorites() {
   if (!state.favorites.length) {
     status.style.display = 'block';
     grid.style.display = 'none';
+    grid.innerHTML = '';
     return;
   }
   status.style.display = 'none';
@@ -446,23 +624,29 @@ function renderFavorites() {
 }
 
 // ============ MAP ============
-function renderMap() {
+function renderMap(options = {}) {
+  const preserveView = options.preserveView === true;
   if (!state.map) {
-    state.map = L.map('map').setView([state.lat || 51.5, state.lon || -0.1], 14);
+    state.map = L.map('map').setView([
+      state.lat !== null ? state.lat : 51.5,
+      state.lon !== null ? state.lon : -0.1
+    ], 14);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
       maxZoom: 19,
       attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>'
     }).addTo(state.map);
+    state.map.on('zoomend', () => renderMap({ preserveView: true }));
   } else {
-    if (state.lat) state.map.setView([state.lat, state.lon], 14);
-    state.markers.forEach(m => state.map.removeLayer(m));
-    state.markers = [];
+    if (state.lat !== null && state.lon !== null && !preserveView) {
+      state.map.setView([state.lat, state.lon], 14);
+    }
   }
+  clearMapMarkers();
 
-  if (state.lat) {
+  if (state.lat !== null && state.lon !== null) {
     const userIcon = L.divIcon({
       className: '',
-      html: `<div style="width:18px;height:18px;border-radius:50%;background:#1a1612;border:3px solid #d2391e;box-shadow:0 0 0 4px rgba(210,57,30,0.25);"></div>`,
+      html: '<div class="map-user-marker"></div>',
       iconSize: [18, 18],
       iconAnchor: [9, 9]
     });
@@ -471,24 +655,86 @@ function renderMap() {
     state.markers.push(m);
   }
 
-  state.filteredResults.forEach(r => {
-    const icon = L.divIcon({
-      className: '',
-      html: `<div style="width:24px;height:24px;border-radius:50%;background:#fbf6e9;border:2px solid #1a1612;display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#1a1612;box-shadow:2px 2px 0 #1a1612;">${'£'.repeat(r.price)}</div>`,
-      iconSize: [24, 24],
-      iconAnchor: [12, 12]
-    });
-    const marker = L.marker([r.lat, r.lon], { icon }).addTo(state.map);
-    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(r.name + ' ' + r.address)}`;
-    marker.bindPopup(`
-      <div class="map-popup">
-        <h4><a href="${searchUrl}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a></h4>
-        <p>${escapeHtml(r.cuisines.join(' · '))}</p>
-        <p>${'£'.repeat(r.price)} · ${r.distance < 1 ? Math.round(r.distance * 1000) + ' m' : r.distance.toFixed(1) + ' km'}</p>
-      </div>
-    `);
+  getMapClusters().forEach(cluster => {
+    const marker = cluster.items.length === 1
+      ? createPlaceMarker(cluster.items[0])
+      : createClusterMarker(cluster);
     state.markers.push(marker);
   });
+}
+
+function clearMapMarkers() {
+  state.markers.forEach(m => state.map.removeLayer(m));
+  state.markers = [];
+}
+
+function getMapClusters() {
+  if (!state.map) return [];
+
+  const zoom = state.map.getZoom();
+  const groups = new Map();
+  state.filteredResults.forEach(r => {
+    const point = state.map.project([r.lat, r.lon], zoom);
+    const key = `${Math.floor(point.x / MAP_CLUSTER_SIZE_PX)}:${Math.floor(point.y / MAP_CLUSTER_SIZE_PX)}`;
+    if (!groups.has(key)) {
+      groups.set(key, { items: [], latTotal: 0, lonTotal: 0 });
+    }
+    const group = groups.get(key);
+    group.items.push(r);
+    group.latTotal += r.lat;
+    group.lonTotal += r.lon;
+  });
+
+  return [...groups.values()].map(group => ({
+    items: group.items,
+    lat: group.latTotal / group.items.length,
+    lon: group.lonTotal / group.items.length
+  }));
+}
+
+function createPlaceMarker(r) {
+  const icon = L.divIcon({
+    className: '',
+    html: `<div class="map-price-marker">${'£'.repeat(r.price)}</div>`,
+    iconSize: [24, 24],
+    iconAnchor: [12, 12]
+  });
+  const marker = L.marker([r.lat, r.lon], { icon }).addTo(state.map);
+  marker.bindPopup(placePopupHTML(r));
+  return marker;
+}
+
+function createClusterMarker(cluster) {
+  const icon = L.divIcon({
+    className: '',
+    html: `<div class="map-cluster-marker">${cluster.items.length}</div>`,
+    iconSize: [34, 34],
+    iconAnchor: [17, 17]
+  });
+  const marker = L.marker([cluster.lat, cluster.lon], { icon }).addTo(state.map);
+  marker.bindPopup(clusterPopupHTML(cluster.items));
+  return marker;
+}
+
+function placePopupHTML(r) {
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(r.name + ' ' + r.address)}`;
+  return `
+    <div class="map-popup">
+      <h4><a href="${searchUrl}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a></h4>
+      <p>${escapeHtml(r.cuisines.join(' · '))}</p>
+      <p>${'£'.repeat(r.price)} · ${formatDistance(r.distance)}</p>
+    </div>
+  `;
+}
+
+function clusterPopupHTML(items) {
+  const nearest = [...items].sort((a, b) => a.distance - b.distance).slice(0, 5);
+  return `
+    <div class="map-popup">
+      <h4>${items.length} food spots nearby</h4>
+      <p>${nearest.map(r => `${escapeHtml(r.name)} (${formatDistance(r.distance)})`).join('<br>')}</p>
+    </div>
+  `;
 }
 
 // ============ SURPRISE ============
@@ -499,7 +745,7 @@ function surpriseMe() {
   }
   const r = state.filteredResults[Math.floor(Math.random() * state.filteredResults.length)];
   document.getElementById('surpriseMeta').textContent =
-    `${'£'.repeat(r.price)} · ${r.cuisines[0]} · ${r.distance < 1 ? Math.round(r.distance * 1000) + ' m' : r.distance.toFixed(1) + ' km away'}`;
+    `${'£'.repeat(r.price)} · ${r.cuisines[0]} · ${formatDistance(r.distance)} away`;
   document.getElementById('surpriseName').textContent = r.name;
   document.getElementById('surpriseAddr').textContent = r.address;
   document.getElementById('surpriseBox').classList.add('visible');
@@ -531,7 +777,22 @@ function showLoading() {
   document.getElementById('initialStatus').innerHTML = `
     <div class="spinner"></div>
     <h3 style="margin-top:18px;">Consulting the almanack…</h3>
-    <p>Sifting through the neighbourhood for places worth eating.</p>
+    <p id="searchStatusText">Sifting through the neighbourhood for places worth eating.</p>
+  `;
+}
+
+function updateSearchStatus(message) {
+  const status = document.getElementById('searchStatusText');
+  if (status) status.textContent = message;
+}
+
+function showIdleStatus(title, message) {
+  document.getElementById('initialStatus').style.display = 'block';
+  document.getElementById('resultsContent').style.display = 'none';
+  document.getElementById('initialStatus').innerHTML = `
+    <div class="ornament">❦</div>
+    <h3>${escapeHtml(title)}</h3>
+    <p>${escapeHtml(message)}</p>
   `;
 }
 
