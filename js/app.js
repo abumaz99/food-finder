@@ -8,6 +8,7 @@ const state = {
   lat: null,
   lon: null,
   locationLabel: '',
+  lastGeocodedInput: '',
   results: [],
   filteredResults: [],
   favorites: [],
@@ -15,7 +16,8 @@ const state = {
   selectedCuisines: new Set(),
   map: null,
   markers: [],
-  currentTab: 'list'
+  currentTab: 'list',
+  searching: false
 };
 
 // ============ INIT ============
@@ -62,7 +64,7 @@ function init() {
   const distanceInput = document.getElementById('distance');
   const distanceVal = document.getElementById('distanceVal');
   distanceInput.addEventListener('input', () => {
-    distanceVal.textContent = `${parseFloat(distanceInput.value).toFixed(1)} km`;
+    distanceVal.textContent = `${getDistanceKm().toFixed(1)} km`;
   });
 
   document.getElementById('gpsBtn').addEventListener('click', useGPS);
@@ -119,45 +121,69 @@ function useGPS() {
 // ============ GEOCODE ============
 async function geocode(query) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
-  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  if (!res.ok) throw new Error('Geocoding failed');
-  const data = await res.json();
-  if (!data.length) throw new Error('Location not found');
-  return {
-    lat: parseFloat(data[0].lat),
-    lon: parseFloat(data[0].lon),
-    display: data[0].display_name
-  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+      signal: controller.signal
+    });
+    if (!res.ok) throw new Error('Geocoding failed');
+    const data = await res.json();
+    if (!data.length) throw new Error('Location not found');
+    return {
+      lat: parseFloat(data[0].lat),
+      lon: parseFloat(data[0].lon),
+      display: data[0].display_name
+    };
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Geocoding timed out — try again');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ============ OVERPASS FETCH ============
 const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass-api.de/api/interpreter'
+  'https://overpass.private.coffee/api/interpreter'
 ];
 
 async function fetchOverpass(query) {
+  let lastStatus = null;
   for (const endpoint of OVERPASS_ENDPOINTS) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), 30000);
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
         body: 'data=' + encodeURIComponent(query),
         signal: controller.signal
       });
       clearTimeout(timer);
       if (res.ok) return res.json();
+      lastStatus = res.status;
     } catch (_) {
       clearTimeout(timer);
       // network error or timeout — try next endpoint
     }
   }
-  throw new Error('Could not reach Overpass API — try again shortly');
+  const hint = lastStatus === 429
+    ? 'rate-limited — wait a moment'
+    : 'all servers busy — try a smaller radius';
+  throw new Error(`Overpass unavailable (${hint})`);
 }
 
 // ============ SEARCH ============
 async function search() {
+  if (state.searching) return;
+
   hideError();
   const locInput = document.getElementById('location').value.trim();
   if (!locInput && state.lat === null) {
@@ -165,35 +191,48 @@ async function search() {
     return;
   }
 
+  state.searching = true;
+  const searchBtn = document.getElementById('searchBtn');
+  const originalLabel = searchBtn.textContent;
+  searchBtn.disabled = true;
+  searchBtn.textContent = 'Searching…';
   showLoading();
 
   try {
     if (locInput && !locInput.match(/^-?\d+\.\d+,\s*-?\d+\.\d+$/)) {
-      const geo = await geocode(locInput);
-      state.lat = geo.lat;
-      state.lon = geo.lon;
-      state.locationLabel = geo.display.split(',')[0];
+      if (locInput !== state.lastGeocodedInput || state.lat === null || state.lon === null) {
+        const geo = await geocode(locInput);
+        state.lat = geo.lat;
+        state.lon = geo.lon;
+        state.locationLabel = geo.display.split(',')[0];
+        state.lastGeocodedInput = locInput;
+      }
     } else if (locInput.match(/^-?\d+\.\d+,\s*-?\d+\.\d+$/)) {
       const [lat, lon] = locInput.split(',').map(s => parseFloat(s.trim()));
       state.lat = lat;
       state.lon = lon;
     }
 
-    if (!state.lat) throw new Error('Could not determine location');
+    if (state.lat === null || state.lon === null) throw new Error('Could not determine location');
 
-    const radius = parseFloat(document.getElementById('distance').value) * 1000;
-    const q = `[out:json][timeout:15];
+    const radiusKm = getDistanceKm();
+    if (!Number.isFinite(radiusKm) || radiusKm <= 0) {
+      throw new Error('Choose a valid distance');
+    }
+
+    const radius = Math.round(radiusKm * 1000);
+    const q = `[out:json][timeout:25];
 (
   node["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
   way["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
 );
-out center qt tags 150;`;
+out center qt tags;`;
 
     const data = await fetchOverpass(q);
 
     state.results = data.elements
       .map(el => parseElement(el))
-      .filter(r => r && r.name);
+      .filter(r => r && r.name && r.distance <= radiusKm);
 
     applyFilters();
     sortAndRender();
@@ -201,6 +240,10 @@ out center qt tags 150;`;
     showError('Search failed: ' + err.message);
     document.getElementById('initialStatus').style.display = 'block';
     document.getElementById('resultsContent').style.display = 'none';
+  } finally {
+    state.searching = false;
+    searchBtn.disabled = false;
+    searchBtn.textContent = originalLabel;
   }
 }
 
@@ -209,9 +252,9 @@ function parseElement(el) {
   const tags = el.tags || {};
   if (!tags.name) return null;
 
-  const lat = el.lat || (el.center && el.center.lat);
-  const lon = el.lon || (el.center && el.center.lon);
-  if (!lat || !lon) return null;
+  const lat = Number(el.lat ?? (el.center && el.center.lat));
+  const lon = Number(el.lon ?? (el.center && el.center.lon));
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
 
   const dist = haversine(state.lat, state.lon, lat, lon);
 
@@ -277,6 +320,10 @@ function parseElement(el) {
 }
 
 // ============ FILTER / SORT ============
+function getDistanceKm() {
+  return parseFloat(document.getElementById('distance').value);
+}
+
 function applyFilters() {
   const openNowOnly = document.getElementById('openNowOnly').checked;
   state.filteredResults = state.results.filter(r => {
