@@ -1,23 +1,18 @@
 /**
  * Forkward — Holiday Food Finder
- * Main application logic: state, data fetching, rendering, map.
+ * Main application logic: state, Google Places fetching, rendering, map.
  */
 
 // ============ STATE ============
-const INITIAL_VISIBLE_RESULTS = 100;
-const RESULTS_INCREMENT = 100;
-const MAP_CLUSTER_SIZE_PX = 64;
-const OVERPASS_TIMEOUT_MS = 18000;
-const OVERPASS_STAGGER_MS = 1200;
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter'
-];
+const INITIAL_VISIBLE_RESULTS = 20;
+const RESULTS_INCREMENT = 20;
 const FAVORITES_STORAGE_KEY = 'forkward:favorites';
-const OVERPASS_ENDPOINT_STORAGE_KEY = 'forkward:lastOverpassEndpoint';
+const DEFAULT_MAP_CENTER = { lat: 51.5074, lng: -0.1278 };
+
+let googleMapsLoadPromise = null;
 
 const state = {
+  config: null,
   lat: null,
   lon: null,
   locationLabel: '',
@@ -27,11 +22,16 @@ const state = {
   filteredResults: [],
   favorites: [],
   visibleCount: INITIAL_VISIBLE_RESULTS,
+  requestedRadiusKm: null,
   searchRadiusKm: null,
+  searchExpanded: false,
+  relaxedTypes: false,
+  resultNotice: '',
   selectedPrices: new Set([1, 2, 3, 4]),
   selectedCuisines: new Set(),
   map: null,
   markers: [],
+  infoWindow: null,
   searchController: null,
   currentTab: 'list',
   searching: false
@@ -42,14 +42,12 @@ function init() {
   loadFavorites();
   updateFavoriteCount();
 
-  // Date in masthead
   const d = new Date();
   const dateStr = d.toLocaleDateString('en-GB', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
   }).toUpperCase();
   document.getElementById('dateline').textContent = `— ${dateStr} —`;
 
-  // Cuisine pills
   const cuisinePills = document.getElementById('cuisinePills');
   Object.keys(CUISINES).forEach(cuisine => {
     const pill = document.createElement('button');
@@ -64,7 +62,6 @@ function init() {
     cuisinePills.appendChild(pill);
   });
 
-  // Price pills
   document.querySelectorAll('#pricePills .pill').forEach(pill => {
     pill.setAttribute('aria-pressed', 'true');
     pill.addEventListener('click', () => {
@@ -72,7 +69,13 @@ function init() {
     });
   });
 
-  // Distance display
+  const openNowOnly = document.getElementById('openNowOnly');
+  openNowOnly.checked = false;
+  openNowOnly.disabled = true;
+  openNowOnly.closest('.toggle-row').classList.add('is-disabled');
+  openNowOnly.closest('.toggle-row').title =
+    'Open-now filtering is coming in a later version.';
+
   const distanceInput = document.getElementById('distance');
   const distanceVal = document.getElementById('distanceVal');
   distanceInput.addEventListener('input', () => {
@@ -100,10 +103,6 @@ function init() {
   document.getElementById('sortBy').addEventListener('change', () => {
     state.visibleCount = INITIAL_VISIBLE_RESULTS;
     sortAndRender();
-  });
-
-  document.getElementById('openNowOnly').addEventListener('change', () => {
-    if (state.results.length) refreshFilters();
   });
 
   document.getElementById('surpriseAgain').addEventListener('click', surpriseMe);
@@ -162,7 +161,7 @@ function useGPS() {
       btn.textContent = '✓';
       setTimeout(() => { btn.textContent = '⊙'; btn.disabled = false; }, 1200);
     },
-    err => {
+    () => {
       showError('Location access denied. Try entering it manually.');
       btn.textContent = '⊙';
       btn.disabled = false;
@@ -171,172 +170,96 @@ function useGPS() {
   );
 }
 
-// ============ GEOCODE ============
+// ============ API ============
+async function getAppConfig(signal) {
+  if (state.config) return state.config;
+  const res = await fetch('/api/config', {
+    headers: { 'Accept': 'application/json' },
+    signal
+  });
+  const data = await readJsonResponse(res);
+  if (!res.ok) throw new Error(data.error || 'App configuration failed.');
+  state.config = data;
+  return data;
+}
+
 async function geocode(query, signal) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
-  const controller = new AbortController();
-  const abortSearch = () => controller.abort();
-  if (signal) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener('abort', abortSearch, { once: true });
-  }
-  const timer = setTimeout(() => controller.abort(), 8000);
-  try {
-    const res = await fetch(url, {
-      headers: { 'Accept': 'application/json' },
-      signal: controller.signal
-    });
-    if (!res.ok) throw new Error('Geocoding failed');
-    const data = await res.json();
-    if (!data.length) throw new Error('Location not found');
-    return {
-      lat: parseFloat(data[0].lat),
-      lon: parseFloat(data[0].lon),
-      display: data[0].display_name
-    };
-  } catch (e) {
-    if (e.name === 'AbortError' && signal && signal.aborted) throw e;
-    if (e.name === 'AbortError') throw new Error('Geocoding timed out — try again');
-    throw e;
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', abortSearch);
-  }
+  const url = `/api/geocode?query=${encodeURIComponent(query)}`;
+  const res = await fetch(url, {
+    headers: { 'Accept': 'application/json' },
+    signal
+  });
+  const data = await readJsonResponse(res);
+  if (!res.ok) throw new Error(data.error || 'Location not found.');
+  return data;
 }
 
-// ============ OVERPASS FETCH ============
-async function fetchOverpass(query, signal) {
-  if (signal && signal.aborted) throw new DOMException('Search cancelled', 'AbortError');
-
+async function fetchPlaces(payload, signal) {
   updateSearchStatus('Looking for nearby food spots…');
+  const res = await fetch('/api/places', {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload),
+    signal
+  });
+  const data = await readJsonResponse(res);
+  if (!res.ok) throw new Error(data.error || 'Food spot search failed.');
+  return data;
+}
 
-  let lastStatus = null;
-  const controllers = [];
-  const raceController = new AbortController();
-  const abortRace = () => raceController.abort();
-  if (signal) signal.addEventListener('abort', abortRace, { once: true });
-
-  const endpoints = getPreferredOverpassEndpoints();
-  const requests = endpoints.map((endpoint, index) =>
-    delayedOverpassRequest(endpoint, query, raceController.signal, index * OVERPASS_STAGGER_MS, controllers)
-      .then(data => ({ endpoint, data }))
-      .catch(err => {
-        if (raceController.signal.aborted) throw err;
-        if (err && err.status) lastStatus = err.status;
-        throw err;
-      })
-  );
-
+async function readJsonResponse(res) {
+  const text = await res.text();
+  if (!text) return {};
   try {
-    const winner = await firstSuccessful(requests);
-    rememberOverpassEndpoint(winner.endpoint);
-    return winner.data;
-  } catch (err) {
-    if (isAbortError(err)) throw err;
-    throw overpassUnavailableError(lastStatus);
-  } finally {
-    raceController.abort();
-    if (signal) signal.removeEventListener('abort', abortRace);
-    controllers.forEach(controller => controller.abort());
+    return JSON.parse(text);
+  } catch (_) {
+    if (res.status === 404) {
+      return { error: 'Backend API not found. Run the app with Vercel so serverless functions are available.' };
+    }
+    return { error: 'Unexpected response from the app backend.' };
   }
 }
 
-async function delayedOverpassRequest(endpoint, query, signal, delayMs, controllers) {
-  if (delayMs > 0) {
-    await delay(delayMs, signal);
+// ============ GOOGLE MAPS ============
+function ensureGoogleMaps(signal) {
+  if (window.google && window.google.maps && window.google.maps.Map) {
+    return Promise.resolve();
   }
-  if (signal && signal.aborted) throw new DOMException('Search cancelled', 'AbortError');
+  if (googleMapsLoadPromise) return googleMapsLoadPromise;
 
-  const controller = new AbortController();
-  controllers.push(controller);
-  const abortSearch = () => controller.abort();
-  if (signal) signal.addEventListener('abort', abortSearch, { once: true });
-  const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
-
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: 'data=' + encodeURIComponent(query),
-      signal: controller.signal
-    });
-
-    if (!res.ok) {
-      const err = new Error(`Overpass returned ${res.status}`);
-      err.status = res.status;
-      throw err;
+  googleMapsLoadPromise = getAppConfig(signal).then(config => {
+    if (!config.mapsApiKey) {
+      throw new Error('Google Maps browser key is not configured.');
     }
 
-    return res.json();
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', abortSearch);
-  }
-}
+    return new Promise((resolve, reject) => {
+      const callbackName = `forkwardGoogleMapsReady_${Date.now()}`;
+      const script = document.createElement('script');
+      const cleanup = () => {
+        delete window[callbackName];
+      };
 
-function firstSuccessful(promises) {
-  return new Promise((resolve, reject) => {
-    let rejectedCount = 0;
-    let lastError = null;
+      window[callbackName] = () => {
+        cleanup();
+        resolve();
+      };
 
-    promises.forEach(promise => {
-      promise.then(resolve).catch(err => {
-        rejectedCount += 1;
-        lastError = err;
-        if (rejectedCount === promises.length) reject(lastError);
-      });
+      script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(config.mapsApiKey)}&loading=async&callback=${callbackName}`;
+      script.async = true;
+      script.defer = true;
+      script.onerror = () => {
+        cleanup();
+        googleMapsLoadPromise = null;
+        reject(new Error('Google Maps could not load.'));
+      };
+      document.head.appendChild(script);
     });
   });
-}
 
-function delay(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal && signal.aborted) {
-      reject(new DOMException('Search cancelled', 'AbortError'));
-      return;
-    }
-
-    let abortDelay = null;
-    const timer = setTimeout(() => {
-      if (signal && abortDelay) signal.removeEventListener('abort', abortDelay);
-      resolve();
-    }, ms);
-    abortDelay = () => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', abortDelay);
-      reject(new DOMException('Search cancelled', 'AbortError'));
-    };
-    if (signal) signal.addEventListener('abort', abortDelay, { once: true });
-  });
-}
-
-function getPreferredOverpassEndpoints() {
-  let preferred = null;
-  try {
-    preferred = localStorage.getItem(OVERPASS_ENDPOINT_STORAGE_KEY);
-  } catch (_) {
-    preferred = null;
-  }
-  if (!preferred || !OVERPASS_ENDPOINTS.includes(preferred)) return OVERPASS_ENDPOINTS;
-  return [preferred, ...OVERPASS_ENDPOINTS.filter(endpoint => endpoint !== preferred)];
-}
-
-function rememberOverpassEndpoint(endpoint) {
-  try {
-    localStorage.setItem(OVERPASS_ENDPOINT_STORAGE_KEY, endpoint);
-  } catch (_) {
-    // A remembered endpoint is only an optimization.
-  }
-}
-
-function overpassUnavailableError(lastStatus) {
-  const hint = lastStatus === 429
-    ? 'rate-limited — wait a moment'
-    : 'all servers busy — try a smaller radius';
-  return new Error(`Map data is busy (${hint})`);
+  return googleMapsLoadPromise;
 }
 
 // ============ SEARCH ============
@@ -358,7 +281,7 @@ async function search() {
   showLoading();
 
   try {
-    if (locInput && !locInput.match(/^-?\d+\.\d+,\s*-?\d+\.\d+$/)) {
+    if (locInput && !isCoordinateInput(locInput)) {
       if (locInput !== state.lastGeocodedInput || !state.lastGeocodedCoords) {
         updateSearchStatus('Finding those coordinates…');
         const geo = await geocode(locInput, state.searchController.signal);
@@ -371,7 +294,7 @@ async function search() {
         state.lat = state.lastGeocodedCoords.lat;
         state.lon = state.lastGeocodedCoords.lon;
       }
-    } else if (locInput.match(/^-?\d+\.\d+,\s*-?\d+\.\d+$/)) {
+    } else if (isCoordinateInput(locInput)) {
       const [lat, lon] = locInput.split(',').map(s => parseFloat(s.trim()));
       state.lat = lat;
       state.lon = lon;
@@ -379,27 +302,26 @@ async function search() {
       state.lastGeocodedCoords = null;
     }
 
-    if (state.lat === null || state.lon === null) throw new Error('Could not determine location');
+    if (state.lat === null || state.lon === null) throw new Error('Could not determine location.');
 
     const radiusKm = getDistanceKm();
     if (!Number.isFinite(radiusKm) || radiusKm <= 0) {
-      throw new Error('Choose a valid distance');
+      throw new Error('Choose a valid distance.');
     }
 
-    const radius = Math.round(radiusKm * 1000);
-    const q = `[out:json][timeout:14];
-(
-  node["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
-  way["amenity"~"^(restaurant|cafe|pub|bar|fast_food)$"](around:${radius},${state.lat},${state.lon});
-);
-out center qt tags;`;
+    const data = await fetchPlaces({
+      lat: state.lat,
+      lon: state.lon,
+      radiusKm,
+      cuisines: [...state.selectedCuisines]
+    }, state.searchController.signal);
 
-    const data = await fetchOverpass(q, state.searchController.signal);
-
-    state.results = data.elements
-      .map(el => parseElement(el))
-      .filter(r => r && r.name && r.distance <= radiusKm);
-    state.searchRadiusKm = radiusKm;
+    state.results = normalizeClientResults(data.places || []);
+    state.requestedRadiusKm = data.requestedRadiusKm || radiusKm;
+    state.searchRadiusKm = data.searchRadiusKm || radiusKm;
+    state.searchExpanded = data.expandedRadius === true;
+    state.relaxedTypes = data.relaxedTypes === true;
+    state.resultNotice = buildSearchNotice(data);
     state.visibleCount = INITIAL_VISIBLE_RESULTS;
 
     applyFilters();
@@ -414,9 +336,10 @@ out center qt tags;`;
     } else {
       showError('Search failed: ' + err.message);
       if (state.filteredResults.length) {
+        state.resultNotice = 'Showing your previous results while the latest search recovers.';
         renderResults();
       } else {
-        showIdleStatus('Search could not finish', 'Try again in a moment, or use a smaller radius while map data is busy.');
+        showIdleStatus('Search could not finish', 'Try again in a moment, or check the Google API keys in Vercel.');
       }
     }
   } finally {
@@ -434,76 +357,48 @@ function isAbortError(err) {
   return err && err.name === 'AbortError';
 }
 
-// ============ PARSE OSM ELEMENT ============
-function parseElement(el) {
-  const tags = el.tags || {};
-  if (!tags.name) return null;
+function isCoordinateInput(value) {
+  return /^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$/.test(value);
+}
 
-  const lat = Number(el.lat ?? (el.center && el.center.lat));
-  const lon = Number(el.lon ?? (el.center && el.center.lon));
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+function normalizeClientResults(results) {
+  return results
+    .map(r => ({
+      ...r,
+      lat: Number(r.lat),
+      lon: Number(r.lon),
+      distance: Number(r.distance),
+      price: clampPrice(r.price),
+      cuisines: Array.isArray(r.cuisines) && r.cuisines.length ? r.cuisines : ['Restaurant'],
+      isOpen: null
+    }))
+    .filter(r =>
+      r.id
+      && r.name
+      && Number.isFinite(r.lat)
+      && Number.isFinite(r.lon)
+      && Number.isFinite(r.distance)
+    );
+}
 
-  const dist = haversine(state.lat, state.lon, lat, lon);
+function clampPrice(value) {
+  const price = Number(value);
+  if (!Number.isFinite(price)) return 2;
+  return Math.min(4, Math.max(1, Math.round(price)));
+}
 
-  // Map OSM cuisine tags to our display categories
-  const osmCuisines = (tags.cuisine || '').toLowerCase()
-    .split(/[;,]/).map(s => s.trim()).filter(Boolean);
-  const amenity = tags.amenity || '';
-  if (amenity === 'cafe') osmCuisines.push('cafe');
-  if (amenity === 'pub')  osmCuisines.push('pub');
-  if (amenity === 'bar')  osmCuisines.push('bar');
-
-  let displayCuisines = [];
-  for (const [label, tagsList] of Object.entries(CUISINES)) {
-    if (osmCuisines.some(c => tagsList.includes(c))) displayCuisines.push(label);
+function buildSearchNotice(data) {
+  const messages = [];
+  if (data.relaxedTypes) {
+    messages.push('No exact cuisine matches were nearby, so these are the closest food spots found.');
   }
-  if (!displayCuisines.length) {
-    if (osmCuisines.length) {
-      displayCuisines.push(
-        osmCuisines[0].replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-      );
-    } else {
-      const cap = amenity.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-      displayCuisines.push(cap || 'Restaurant');
-    }
+  if (data.expandedRadius) {
+    messages.push(`No matches appeared within ${Number(data.requestedRadiusKm).toFixed(1)} km, so the search expanded to ${Number(data.searchRadiusKm).toFixed(1)} km.`);
   }
-
-  // Approximate price level (OSM has no price tag)
-  let price = 2;
-  if      (amenity === 'fast_food')               price = 1;
-  else if (amenity === 'cafe')                    price = 1;
-  else if (amenity === 'pub' || amenity === 'bar') price = 2;
-  else if (amenity === 'restaurant')              price = 2;
-
-  const nameLow = (tags.name || '').toLowerCase();
-  if      (/michelin|fine dining|tasting menu|haute/.test(nameLow)) price = 4;
-  else if (tags['stars'] || tags['michelin_stars'])                 price = 4;
-
-  const addrParts = [
-    tags['addr:housenumber'],
-    tags['addr:street'],
-    tags['addr:city'] || tags['addr:suburb']
-  ].filter(Boolean);
-  const address = addrParts.join(' ') || 'Address unavailable';
-
-  const openingHours = tags.opening_hours || null;
-  const isOpen = openingHours ? checkOpenNow(openingHours) : null;
-
-  return {
-    id: `${el.type}/${el.id}`,
-    name: tags.name,
-    lat, lon,
-    distance: dist,
-    cuisines: displayCuisines,
-    price,
-    address,
-    phone: tags.phone || tags['contact:phone'] || null,
-    website: tags.website || tags['contact:website'] || null,
-    openingHours,
-    isOpen,
-    osmType: el.type,
-    osmId: el.id
-  };
+  if (data.maxResultCount) {
+    messages.push('Showing a short list of nearby choices.');
+  }
+  return messages.join(' ');
 }
 
 // ============ FILTER / SORT ============
@@ -533,18 +428,24 @@ function safeHttpUrl(value) {
 }
 
 function applyFilters() {
-  const openNowOnly = document.getElementById('openNowOnly').checked;
-  const radiusKm = getDistanceKm();
+  const radiusKm = getDistanceLimitKm();
   state.filteredResults = state.results.filter(r => {
     if (Number.isFinite(radiusKm) && r.distance > radiusKm) return false;
     if (!state.selectedPrices.has(r.price)) return false;
-    if (state.selectedCuisines.size > 0) {
+    if (!state.relaxedTypes && state.selectedCuisines.size > 0) {
       const matches = r.cuisines.some(c => state.selectedCuisines.has(c));
       if (!matches) return false;
     }
-    if (openNowOnly && r.isOpen !== true) return false;
     return true;
   });
+}
+
+function getDistanceLimitKm() {
+  const selectedRadiusKm = getDistanceKm();
+  if (state.searchExpanded && state.searchRadiusKm !== null) {
+    return Math.max(selectedRadiusKm, state.searchRadiusKm);
+  }
+  return selectedRadiusKm;
 }
 
 function sortAndRender() {
@@ -582,6 +483,7 @@ function renderResults() {
   const expandedRadiusNote = getExpandedRadiusNote();
   grid.innerHTML = visibleResults.map(r => cardHTML(r)).join('')
     + `${remaining > 0 ? loadMoreHTML(remaining) : ''}`
+    + `${state.resultNotice ? resultNoticeHTML(state.resultNotice) : ''}`
     + `${expandedRadiusNote ? resultNoticeHTML(expandedRadiusNote) : ''}`;
 
   grid.querySelectorAll('.fav-btn').forEach(btn => {
@@ -623,7 +525,7 @@ function resultNoticeHTML(message) {
 
 function getExpandedRadiusNote() {
   const radiusKm = getDistanceKm();
-  if (state.searchRadiusKm !== null && radiusKm > state.searchRadiusKm) {
+  if (!state.searchExpanded && state.searchRadiusKm !== null && radiusKm > state.searchRadiusKm) {
     return `Showing matches from the last ${state.searchRadiusKm.toFixed(1)} km search. Run search again to expand to ${radiusKm.toFixed(1)} km.`;
   }
   return '';
@@ -633,34 +535,37 @@ function cardHTML(r) {
   const isFav = state.favorites.some(f => f.id === r.id);
   const priceStr = '£'.repeat(r.price);
   const distStr = formatDistance(r.distance);
-  let openTag = '';
-  if      (r.isOpen === true)  openTag = '<span class="open-now">● Open now</span>';
-  else if (r.isOpen === false) openTag = '<span class="closed-now">● Closed</span>';
-
-  const osmUrl = `https://www.openstreetmap.org/${r.osmType}/${r.osmId}`;
-  const directionsUrl = `https://www.google.com/maps/dir/?api=1&destination=${r.lat},${r.lon}`;
+  const directionsUrl = getDirectionsUrl(r);
   const websiteUrl = safeHttpUrl(r.website);
+  const moreUrl = safeHttpUrl(r.googleMapsUri) || directionsUrl;
 
   return `
-    <article class="card" data-id="${r.id}">
+    <article class="card" data-id="${escapeAttr(r.id)}">
       <div class="card-header">
         <h3>${escapeHtml(r.name)}</h3>
-        <button class="fav-btn ${isFav ? 'active' : ''}" data-id="${r.id}" title="${isFav ? 'Remove from favourites' : 'Save to favourites'}">★</button>
+        <button class="fav-btn ${isFav ? 'active' : ''}" data-id="${escapeAttr(r.id)}" title="${isFav ? 'Remove from favourites' : 'Save to favourites'}">★</button>
       </div>
       <div class="cuisine-tag">${escapeHtml(r.cuisines.join(' · '))}</div>
       <div class="card-meta">
         <span class="price">${priceStr}</span>
         <span>· ${distStr}</span>
-        ${openTag ? `<span>·</span>${openTag}` : ''}
       </div>
-      <div class="address">${escapeHtml(r.address)}</div>
+      <div class="address">${escapeHtml(r.address || 'Address unavailable')}</div>
       <div class="card-footer">
-        <a class="mini-btn" href="${directionsUrl}" target="_blank" rel="noopener">↗ Directions</a>
+        <a class="mini-btn" href="${escapeAttr(directionsUrl)}" target="_blank" rel="noopener">↗ Directions</a>
         ${websiteUrl ? `<a class="mini-btn" href="${escapeAttr(websiteUrl)}" target="_blank" rel="noopener">⌘ Website</a>` : ''}
-        <a class="mini-btn" href="${osmUrl}" target="_blank" rel="noopener">ⓘ More</a>
+        <a class="mini-btn" href="${escapeAttr(moreUrl)}" target="_blank" rel="noopener">ⓘ Maps</a>
       </div>
     </article>
   `;
+}
+
+function getDirectionsUrl(r) {
+  if (r.googlePlaceId) {
+    const destination = encodeURIComponent(r.name || `${r.lat},${r.lon}`);
+    return `https://www.google.com/maps/dir/?api=1&destination=${destination}&destination_place_id=${encodeURIComponent(r.googlePlaceId)}`;
+  }
+  return `https://www.google.com/maps/dir/?api=1&destination=${r.lat},${r.lon}`;
 }
 
 // ============ FAVORITES ============
@@ -721,115 +626,122 @@ function renderFavorites() {
 }
 
 // ============ MAP ============
-function renderMap(options = {}) {
+async function renderMap(options = {}) {
   const preserveView = options.preserveView === true;
-  if (!state.map) {
-    state.map = L.map('map').setView([
-      state.lat !== null ? state.lat : 51.5,
-      state.lon !== null ? state.lon : -0.1
-    ], 14);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-      maxZoom: 19,
-      attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>'
-    }).addTo(state.map);
-    state.map.on('zoomend', () => renderMap({ preserveView: true }));
-  } else {
-    if (state.lat !== null && state.lon !== null && !preserveView) {
-      state.map.setView([state.lat, state.lon], 14);
-    }
+  const mapEl = document.getElementById('map');
+
+  try {
+    await ensureGoogleMaps();
+  } catch (err) {
+    mapEl.innerHTML = mapStatusHTML(
+      'Google Maps is not ready',
+      err.message || 'Check the browser API key in Vercel.'
+    );
+    return;
   }
+
+  const center = getMapCenter();
+  if (!state.map) {
+    state.map = new google.maps.Map(mapEl, {
+      center,
+      zoom: 14,
+      mapTypeControl: false,
+      streetViewControl: false,
+      fullscreenControl: true
+    });
+    state.infoWindow = new google.maps.InfoWindow();
+  } else if (!preserveView) {
+    state.map.setCenter(center);
+    state.map.setZoom(14);
+  }
+
   clearMapMarkers();
+  const bounds = new google.maps.LatLngBounds();
+  let boundsCount = 0;
 
   if (state.lat !== null && state.lon !== null) {
-    const userIcon = L.divIcon({
-      className: '',
-      html: '<div class="map-user-marker"></div>',
-      iconSize: [18, 18],
-      iconAnchor: [9, 9]
+    const userMarker = new google.maps.Marker({
+      position: center,
+      map: state.map,
+      title: 'You are here',
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE,
+        scale: 7,
+        fillColor: '#1a1612',
+        fillOpacity: 1,
+        strokeColor: '#d2391e',
+        strokeWeight: 3
+      }
     });
-    const m = L.marker([state.lat, state.lon], { icon: userIcon }).addTo(state.map);
-    m.bindPopup('<strong>You are here</strong>');
-    state.markers.push(m);
+    state.markers.push(userMarker);
+    bounds.extend(center);
+    boundsCount += 1;
   }
 
-  getMapClusters().forEach(cluster => {
-    const marker = cluster.items.length === 1
-      ? createPlaceMarker(cluster.items[0])
-      : createClusterMarker(cluster);
+  state.filteredResults.forEach(r => {
+    const marker = createPlaceMarker(r);
     state.markers.push(marker);
+    bounds.extend({ lat: r.lat, lng: r.lon });
+    boundsCount += 1;
   });
+
+  if (!preserveView && boundsCount > 1) {
+    state.map.fitBounds(bounds, 48);
+    google.maps.event.addListenerOnce(state.map, 'bounds_changed', () => {
+      if (state.map.getZoom() > 16) state.map.setZoom(16);
+    });
+  }
+}
+
+function getMapCenter() {
+  return {
+    lat: state.lat !== null ? state.lat : DEFAULT_MAP_CENTER.lat,
+    lng: state.lon !== null ? state.lon : DEFAULT_MAP_CENTER.lng
+  };
 }
 
 function clearMapMarkers() {
-  state.markers.forEach(m => state.map.removeLayer(m));
+  state.markers.forEach(marker => marker.setMap(null));
   state.markers = [];
 }
 
-function getMapClusters() {
-  if (!state.map) return [];
-
-  const zoom = state.map.getZoom();
-  const groups = new Map();
-  state.filteredResults.forEach(r => {
-    const point = state.map.project([r.lat, r.lon], zoom);
-    const key = `${Math.floor(point.x / MAP_CLUSTER_SIZE_PX)}:${Math.floor(point.y / MAP_CLUSTER_SIZE_PX)}`;
-    if (!groups.has(key)) {
-      groups.set(key, { items: [], latTotal: 0, lonTotal: 0 });
-    }
-    const group = groups.get(key);
-    group.items.push(r);
-    group.latTotal += r.lat;
-    group.lonTotal += r.lon;
-  });
-
-  return [...groups.values()].map(group => ({
-    items: group.items,
-    lat: group.latTotal / group.items.length,
-    lon: group.lonTotal / group.items.length
-  }));
-}
-
 function createPlaceMarker(r) {
-  const icon = L.divIcon({
-    className: '',
-    html: `<div class="map-price-marker">${'£'.repeat(r.price)}</div>`,
-    iconSize: [24, 24],
-    iconAnchor: [12, 12]
+  const marker = new google.maps.Marker({
+    position: { lat: r.lat, lng: r.lon },
+    map: state.map,
+    title: r.name,
+    label: {
+      text: '£'.repeat(r.price),
+      color: '#1a1612',
+      fontFamily: 'JetBrains Mono, monospace',
+      fontSize: '11px',
+      fontWeight: '700'
+    }
   });
-  const marker = L.marker([r.lat, r.lon], { icon }).addTo(state.map);
-  marker.bindPopup(placePopupHTML(r));
-  return marker;
-}
-
-function createClusterMarker(cluster) {
-  const icon = L.divIcon({
-    className: '',
-    html: `<div class="map-cluster-marker">${cluster.items.length}</div>`,
-    iconSize: [34, 34],
-    iconAnchor: [17, 17]
+  marker.addListener('click', () => {
+    state.infoWindow.setContent(placePopupHTML(r));
+    state.infoWindow.open({ anchor: marker, map: state.map });
   });
-  const marker = L.marker([cluster.lat, cluster.lon], { icon }).addTo(state.map);
-  marker.bindPopup(clusterPopupHTML(cluster.items));
   return marker;
 }
 
 function placePopupHTML(r) {
-  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(r.name + ' ' + r.address)}`;
+  const moreUrl = safeHttpUrl(r.googleMapsUri) || getDirectionsUrl(r);
   return `
     <div class="map-popup">
-      <h4><a href="${searchUrl}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a></h4>
+      <h4><a href="${escapeAttr(moreUrl)}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a></h4>
       <p>${escapeHtml(r.cuisines.join(' · '))}</p>
       <p>${'£'.repeat(r.price)} · ${formatDistance(r.distance)}</p>
     </div>
   `;
 }
 
-function clusterPopupHTML(items) {
-  const nearest = [...items].sort((a, b) => a.distance - b.distance).slice(0, 5);
+function mapStatusHTML(title, message) {
   return `
-    <div class="map-popup">
-      <h4>${items.length} food spots nearby</h4>
-      <p>${nearest.map(r => `${escapeHtml(r.name)} (${formatDistance(r.distance)})`).join('<br>')}</p>
+    <div class="status map-status">
+      <div class="ornament">◇</div>
+      <h3>${escapeHtml(title)}</h3>
+      <p>${escapeHtml(message)}</p>
     </div>
   `;
 }
@@ -861,7 +773,6 @@ function switchTab(tab) {
   if (tab === 'map') {
     setTimeout(() => {
       renderMap();
-      if (state.map) state.map.invalidateSize();
     }, 50);
   }
   if (tab === 'favorites') renderFavorites();
@@ -869,6 +780,12 @@ function switchTab(tab) {
 
 // ============ STATUS / ERROR ============
 function showLoading() {
+  if (state.filteredResults.length) {
+    state.resultNotice = 'Refreshing nearby food spots…';
+    renderResults();
+    return;
+  }
+
   document.getElementById('initialStatus').style.display = 'block';
   document.getElementById('resultsContent').style.display = 'none';
   document.getElementById('initialStatus').innerHTML = `
@@ -902,7 +819,9 @@ function showError(msg) {
 }
 
 function hideError() {
-  document.getElementById('errorBox').style.display = 'none';
+  const box = document.getElementById('errorBox');
+  box.style.display = 'none';
+  box.textContent = '';
 }
 
 // ============ GO ============

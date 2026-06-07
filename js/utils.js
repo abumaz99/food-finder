@@ -15,7 +15,7 @@ function haversine(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Lightweight OSM `opening_hours` parser.
+ * Lightweight opening-hours parser kept for a future richer data pass.
  * Handles common patterns (e.g. "Mo-Fr 09:00-17:00; Sa,Su 10:00-14:00").
  * Returns true / false / null (null = unparseable).
  */

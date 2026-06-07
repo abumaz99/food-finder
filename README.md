@@ -1,89 +1,108 @@
-# Forkward 🍴
+# Forkward
 
 > A wandering eater's almanack for choosing what to eat, abroad and otherwise.
 
-A static web app that helps you decide where to eat on holiday — or any time you're indecisive. Filter by cuisine, price, distance, and opening hours; or hit "Surprise Me" and let it pick.
-
-## Live demo
-
-Once you've enabled GitHub Pages on this repo, the app lives at:
-
-`https://abumaz99.github.io/food-finder/`
+Forkward helps you decide where to eat when nobody can choose. Search by GPS or typed location, filter by cuisine, price, and distance, then either browse the short list or let "Surprise Me" pick.
 
 ## Features
 
-- 📍 **Location** — by GPS or typed address (city, neighbourhood, full address)
-- 📏 **Distance filter** — adjustable from 300 m to 10 km
-- 💷 **Price filter** — £ to ££££, pick any combination
-- 🍝 **18 cuisine categories** — Italian, Japanese, Middle Eastern, Vegetarian, etc.
-- 🕒 **Open now** filter — parses OpenStreetMap opening hours
-- 🗺️ **Map view** — interactive Leaflet map with custom price-level markers
-- ✦ **Surprise me** — picks one at random from your filtered results
-- ★ **Favourites** — bookmark spots for later (saved on this device)
+- **Location** — by GPS, coordinates, city, neighbourhood, or address
+- **Distance filter** — adjustable from 300 m to 10 km
+- **Price filter** — inferred £ to ££££ price bands
+- **18 cuisine categories** — Italian, Japanese, Middle Eastern, Vegetarian, etc.
+- **Google Maps view** — results displayed on a Google map
+- **Surprise me** — picks one at random from your filtered results
+- **Favourites** — bookmark spots for later, saved on this device
 
 ## Stack
 
-- **Vanilla HTML / CSS / JavaScript** — no build step, no framework, no npm
-- **[Leaflet](https://leafletjs.com/)** — open-source map library
-- **[Overpass API](https://overpass-api.de/)** — queries OpenStreetMap for restaurants
-- **[Nominatim](https://nominatim.openstreetmap.org/)** — geocodes typed locations
-- **Google Fonts** — Fraunces (display) and JetBrains Mono (UI labels)
+- **Vanilla HTML / CSS / JavaScript** — no framework
+- **Vercel Serverless Functions** — hides the private Google server key
+- **Google Places API (New)** — nearby food spot search
+- **Google Geocoding API** — typed location lookup
+- **Google Maps JavaScript API** — map rendering
 
-No API keys required — all data sources are free and open.
+## Google API Setup
 
-## Project structure
+Create two Google Maps Platform API keys:
 
+1. `GOOGLE_MAPS_BROWSER_KEY`
+   - Used by the frontend to load Google Maps JavaScript.
+   - Restrict by HTTP referrer, for example your Vercel domain.
+   - Enable Maps JavaScript API.
+
+2. `GOOGLE_MAPS_SERVER_KEY`
+   - Used only by Vercel functions.
+   - Do not expose this in client-side code.
+   - Enable Places API (New) and Geocoding API.
+
+Set both as Vercel environment variables.
+
+This first pass intentionally uses a cheaper Places field mask:
+
+```text
+places.id
+places.displayName
+places.formattedAddress
+places.location
+places.primaryType
+places.types
+places.businessStatus
+places.googleMapsUri
 ```
-food-finder/
-├── index.html          Main page
-├── css/
-│   └── styles.css      All styles (vintage almanack aesthetic)
-├── js/
-│   ├── cuisines.js     OSM cuisine tag → display label mapping
-│   ├── utils.js        Distance calc, opening-hours parser, escaping
-│   └── app.js          State, search, render, map
-├── README.md
-├── LICENSE
-└── .gitignore
-```
 
-## Running locally
+Ratings, review counts, phone numbers, websites, price levels, and opening hours are omitted for now because those fields trigger higher Places billing tiers. Price is inferred from place type, and the Open Now toggle is disabled until richer fields are enabled.
 
-It's a static site — just open `index.html` in a browser.
+## Running Locally
 
-For best results (some browsers restrict `fetch` on `file://`), serve it over a local HTTP server:
+Use Vercel's local dev server so the `/api` functions are available:
 
 ```bash
-# Python 3
-python3 -m http.server 8000
-
-# Node
-npx serve
-
-# PHP
-php -S localhost:8000
+npx vercel dev
 ```
 
-Then visit <http://localhost:8000>.
+Then visit the local URL Vercel prints.
 
-## Deploying to GitHub Pages
+Opening `index.html` directly or serving it with a plain static server will show the frontend, but searches will fail because `/api/geocode`, `/api/places`, and `/api/config` will not exist.
 
-1. Push to GitHub.
-2. Go to the repo's **Settings → Pages**.
-3. Under "Source", choose **Deploy from a branch**.
-4. Select branch `main` and folder `/ (root)`.
-5. Save. Within a minute or two the site is live at `https://abumaz99.github.io/food-finder/`.
+## Deploying
 
-## Caveats and known limits
+1. Import the repo into Vercel.
+2. Add `GOOGLE_MAPS_BROWSER_KEY` and `GOOGLE_MAPS_SERVER_KEY` in **Project Settings → Environment Variables**.
+3. Deploy `main`.
+4. Restrict the browser key to the Vercel production domain.
+5. Add Google Cloud budget alerts and API quotas.
 
-- **Price levels are approximated.** OSM has no price tag; we infer from amenity type (`fast_food` → £, `restaurant` → ££) and bump to ££££ on keywords like "michelin" or "fine dining". For real Google-style price tiers, swap the Overpass call for the [Google Places API](https://developers.google.com/maps/documentation/places/web-service/overview) or [Foursquare Places](https://docs.foursquare.com/developer/reference/places-api-overview) — both require API keys.
-- **Opening-hours parsing is best-effort.** OSM's `opening_hours` syntax is rich; the parser handles common patterns (e.g. `Mo-Fr 09:00-17:00; Sa,Su 10:00-22:00`, `24/7`) but may show "?" for complex strings.
-- **Coverage depends on OSM data quality.** Dense urban areas (London, Lisbon, Tokyo) are excellent. Smaller towns and rural areas may be sparse.
-- **Favourites are device-local.** They are stored in your browser with `localStorage`, so they stay on this device but do not sync across browsers.
+## Project Structure
+
+```text
+food-finder/
+├── api/
+│   ├── _google.js      Shared Google helpers and result adapter
+│   ├── config.js       Public frontend config
+│   ├── geocode.js      Typed location lookup
+│   └── places.js       Nearby food spot search
+├── css/
+│   └── styles.css      Vintage almanack aesthetic
+├── js/
+│   ├── cuisines.js     Cuisine label → Google Places type mapping
+│   ├── utils.js        Distance calculation, escaping helpers
+│   └── app.js          State, search, rendering, Google Maps
+├── index.html
+├── README.md
+└── LICENSE
+```
+
+## Caveats
+
+- **Nearby Search returns up to 20 places per request.** That fits the "help me decide" flow, but it is not an exhaustive restaurant directory.
+- **Price levels are inferred.** The cheaper field mask does not request Google's `priceLevel`.
+- **Open Now is disabled.** Nearby Search (New) does not support the old `opennow` parameter, and opening-hours fields cost more.
+- **Favourites are device-local.** They are stored in your browser with `localStorage`, so they do not sync across devices.
 
 ## Attribution
 
-Restaurant and map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available under the [Open Database License](https://www.openstreetmap.org/copyright).
+Place and map data are provided by Google Maps Platform.
 
 ## License
 
