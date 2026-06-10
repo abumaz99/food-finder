@@ -115,6 +115,33 @@ header.masthead {
   .layout { grid-template-columns: 1fr; }
 }
 
+@media (max-width: 640px) {
+  .frame {
+    padding: 20px 16px 60px;
+  }
+
+  header.masthead {
+    grid-template-columns: 1fr;
+    text-align: center;
+    gap: 6px;
+  }
+
+  .dateline,
+  .editionline {
+    text-align: center;
+  }
+
+  .logo::after {
+    display: none;
+  }
+
+  footer.colophon {
+    flex-direction: column;
+    gap: 6px;
+    text-align: center;
+  }
+}
+
 /* ============ SIDEBAR / FILTERS ============ */
 aside.controls {
   background: var(--paper);
